@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-screenshots = "0.8"
+scap = "0.1.0-beta.1"
 clap = { version = "4.0", features = ["derive"] }
 image = "0.24"
+tokio = { version = "1.0", features = ["full"] }
