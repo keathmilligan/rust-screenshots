@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process;
+use base64::{Engine as _, engine::general_purpose};
 
 // Import from the local scap library
 use scap::{capturer::{Capturer, Options}, frame::VideoFrame, Target};
@@ -22,60 +23,148 @@ enum Commands {
     Capture {
         /// Screen number to capture
         screen: usize,
-        /// Output filename (optional, defaults to screenshot_<timestamp>.png)
+        /// Output filename (optional, defaults to screenshot_<timestamp>.jpg)
         #[arg(short, long)]
         output: Option<String>,
+        /// Analyze the captured image with LLM (requires LMStudio running locally)
+        #[arg(long)]
+        analyze: bool,
+        /// Custom prompt for LLM analysis
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Capture a window by number
     CaptureWindow {
         /// Window number to capture
         window: usize,
-        /// Output filename (optional, defaults to screenshot_<timestamp>.png)
+        /// Output filename (optional, defaults to screenshot_<timestamp>.jpg)
         #[arg(short, long)]
         output: Option<String>,
+        /// Analyze the captured image with LLM (requires LMStudio running locally)
+        #[arg(long)]
+        analyze: bool,
+        /// Custom prompt for LLM analysis
+        #[arg(long)]
+        prompt: Option<String>,
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::List => list_screens()?,
         Commands::ListWindows => list_windows()?,
-        Commands::Capture { screen, output } => capture_screen(*screen, output.as_deref())?,
-        Commands::CaptureWindow { window, output } => capture_window(*window, output.as_deref())?,
+        Commands::Capture { screen, output, analyze, prompt } => {
+            capture_screen(*screen, output.as_deref(), *analyze, prompt.as_deref()).await?
+        },
+        Commands::CaptureWindow { window, output, analyze, prompt } => {
+            capture_window(*window, output.as_deref(), *analyze, prompt.as_deref()).await?
+        },
     }
 
     Ok(())
 }
 
-fn save_bgra_as_png(bgra_frame: &scap::frame::BGRAFrame, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use image::{ImageBuffer, Rgba};
+fn save_jpeg_bytes(jpeg_bytes: &[u8], filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::Write;
     
-    // Create an image buffer from the BGRA data
-    // Note: BGRA format needs to be converted to RGBA for the image crate
-    let mut rgba_data = Vec::with_capacity(bgra_frame.data.len());
+    println!("Saving {filename}");
+    let mut file = File::create(filename)?;
+    file.write_all(jpeg_bytes)?;
     
-    // Convert BGRA to RGBA by swapping B and R channels
+    Ok(())
+}
+
+async fn analyze_image_with_llm_base64(base64_image: &str, custom_prompt: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    use serde_json::json;
+    
+    let default_prompt = "Analyze this screenshot and describe what you see. Include details about the interface, content, and any notable elements.";
+    let prompt = custom_prompt.unwrap_or(default_prompt);
+    
+    // Use reqwest directly to ensure proper vision API format
+    let vision_payload = json!({
+        "model": "gpt-4-vision-preview",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/jpeg;base64,{}", base64_image)
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 1000
+    });
+    
+    let response = reqwest::Client::new()
+        .post("http://localhost:1234/v1/chat/completions")
+        .header("Authorization", "Bearer lm-studio")
+        .header("Content-Type", "application/json")
+        .json(&vision_payload)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await?;
+        return Err(format!("LLM request failed with status {}: {}. Make sure LMStudio is running on localhost:1234 with a vision model loaded.", status, error_text).into());
+    }
+    
+    let response_json: serde_json::Value = response.json().await?;
+    
+    if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
+        Ok(content.to_string())
+    } else {
+        Err("No content in LLM response".into())
+    }
+}
+
+fn bgra_to_jpeg_bytes(bgra_frame: &scap::frame::BGRAFrame) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use image::{ImageBuffer, Rgb};
+    
+    // Convert BGRA to RGB by swapping B and R channels and dropping alpha
+    let mut rgb_data = Vec::with_capacity((bgra_frame.data.len() * 3) / 4);
     for chunk in bgra_frame.data.chunks_exact(4) {
-        rgba_data.push(chunk[2]); // R (was B)
-        rgba_data.push(chunk[1]); // G
-        rgba_data.push(chunk[0]); // B (was R)
-        rgba_data.push(chunk[3]); // A
+        rgb_data.push(chunk[2]); // R (was B)
+        rgb_data.push(chunk[1]); // G
+        rgb_data.push(chunk[0]); // B (was R)
+        // Drop alpha channel for JPEG
     }
     
     // Create image buffer
-    let img_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+    let img_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
         bgra_frame.width as u32,
         bgra_frame.height as u32,
-        rgba_data,
+        rgb_data,
     ).ok_or("Failed to create image buffer")?;
     
-    // Save as PNG
-    println!("Saving {filename}");
-    img_buffer.save(filename)?;
+    // Convert to JPEG bytes with high quality
+    let mut jpeg_bytes = Vec::new();
+    {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::ImageEncoder;
+        
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 60);
+        encoder.write_image(
+            &img_buffer,
+            img_buffer.width(),
+            img_buffer.height(),
+            image::ColorType::Rgb8,
+        )?;
+    }
     
-    Ok(())
+    Ok(jpeg_bytes)
 }
 
 fn list_screens() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,19 +210,15 @@ fn list_windows() -> Result<(), Box<dyn std::error::Error>> {
 
     let targets = scap::get_all_targets();
     
-    println!("Available windows:");
-    println!("==================");
-    
     let mut window_index = 0;
     for target in targets.iter() {
         match target {
             Target::Window(window) => {
-                println!("Window {}: ID {}",
+                println!("{}: ID {} {}",
                     window_index,
-                    window.id
+                    window.id,
+                    window.title
                 );
-                println!("           Title: {}", window.title);
-                println!();
                 window_index += 1;
             }
             Target::Display(_) => {
@@ -150,7 +235,7 @@ fn list_windows() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn capture_window(window_index: usize, output_filename: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn capture_window(window_index: usize, output_filename: Option<&str>, analyze: bool, prompt: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // Check if screen capture is supported
     if !scap::is_supported() {
         println!("Screen capture not supported");
@@ -206,6 +291,7 @@ fn capture_window(window_index: usize, output_filename: Option<&str>) -> Result<
         excluded_targets: None,
         output_type: scap::frame::FrameType::BGRAFrame,
         target: Some(target),
+        output_resolution: scap::capturer::Resolution::_480p,
         ..Default::default()
     };
 
@@ -217,22 +303,8 @@ fn capture_window(window_index: usize, output_filename: Option<&str>) -> Result<
     });
     println!("Capturer built successfully");
 
-    // Generate filename
-    let filename = match output_filename {
-        Some(name) => {
-            if name.ends_with(".png") {
-                name.to_string()
-            } else {
-                format!("{}.png", name)
-            }
-        }
-        None => {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            format!("window_screenshot_{}.png", timestamp)
-        }
-    };
+    // Generate filename only if output is specified
+    let filename = output_filename;
 
     capturer.start_capture();
     println!("Scap capturer initialized successfully");
@@ -286,10 +358,32 @@ fn capture_window(window_index: usize, output_filename: Option<&str>) -> Result<
                                 bgra_frame.width, bgra_frame.height, bgra_frame.display_time
                             );
                             
-                            // Convert BGRA frame to PNG and save
-                            match save_bgra_as_png(&bgra_frame, &filename) {
-                                Ok(_) => println!("Successfully saved window screenshot to: {}", filename),
-                                Err(e) => println!("Failed to save window screenshot: {}", e),
+                            // Convert to JPEG for both saving and LLM analysis
+                            let jpeg_bytes = match bgra_to_jpeg_bytes(&bgra_frame) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    println!("Failed to convert frame to JPEG: {}", e);
+                                    return Err(e);
+                                }
+                            };
+                            
+                            // Save JPEG if output filename was specified
+                            if let Some(ref filename) = filename {
+                                match save_jpeg_bytes(&jpeg_bytes, filename) {
+                                    Ok(_) => println!("Successfully saved window screenshot to: {}", filename),
+                                    Err(e) => println!("Failed to save window screenshot: {}", e),
+                                }
+                            } else {
+                                println!("Frame captured successfully (no output file specified, not saving)");
+                            }
+                            
+                            // Analyze with LLM if requested
+                            if analyze {
+                                let base64_image = general_purpose::STANDARD.encode(&jpeg_bytes);
+                                match analyze_image_with_llm_base64(&base64_image, prompt).await {
+                                    Ok(analysis) => println!("LLM Analysis:\n{}", analysis),
+                                    Err(e) => println!("LLM analysis failed: {}", e),
+                                }
                             }
                         }
                     }
@@ -308,7 +402,7 @@ fn capture_window(window_index: usize, output_filename: Option<&str>) -> Result<
     }
 }
 
-fn capture_screen(screen_index: usize, output_filename: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn capture_screen(screen_index: usize, output_filename: Option<&str>, analyze: bool, prompt: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // Check if screen capture is supported
     if !scap::is_supported() {
         println!("Screen capture not supported");
@@ -373,22 +467,14 @@ fn capture_screen(screen_index: usize, output_filename: Option<&str>) -> Result<
     });
     println!("Capturer built successfully");
 
-    // Generate filename
-    let filename = match output_filename {
-        Some(name) => {
-            if name.ends_with(".png") {
-                name.to_string()
-            } else {
-                format!("{}.png", name)
-            }
+    // Generate filename only if output is specified
+    let filename = output_filename.map(|name| {
+        if name.ends_with(".png") {
+            name.to_string()
+        } else {
+            format!("{}.png", name)
         }
-        None => {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            format!("screenshot_{}.png", timestamp)
-        }
-    };
+    });
 
     capturer.start_capture();
     println!("Scap capturer initialized successfully");
@@ -442,10 +528,32 @@ fn capture_screen(screen_index: usize, output_filename: Option<&str>) -> Result<
                                 bgra_frame.width, bgra_frame.height, bgra_frame.display_time
                             );
                             
-                            // Convert BGRA frame to PNG and save
-                            match save_bgra_as_png(&bgra_frame, &filename) {
-                                Ok(_) => println!("Successfully saved screenshot to: {}", filename),
-                                Err(e) => println!("Failed to save screenshot: {}", e),
+                            // Convert to JPEG for both saving and LLM analysis
+                            let jpeg_bytes = match bgra_to_jpeg_bytes(&bgra_frame) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    println!("Failed to convert frame to JPEG: {}", e);
+                                    return Err(e);
+                                }
+                            };
+                            
+                            // Save JPEG if output filename was specified
+                            if let Some(ref filename) = filename {
+                                match save_jpeg_bytes(&jpeg_bytes, filename) {
+                                    Ok(_) => println!("Successfully saved screenshot to: {}", filename),
+                                    Err(e) => println!("Failed to save screenshot: {}", e),
+                                }
+                            } else {
+                                println!("Frame captured successfully (no output file specified, not saving)");
+                            }
+                            
+                            // Analyze with LLM if requested
+                            if analyze {
+                                let base64_image = general_purpose::STANDARD.encode(&jpeg_bytes);
+                                match analyze_image_with_llm_base64(&base64_image, prompt).await {
+                                    Ok(analysis) => println!("LLM Analysis:\n{}", analysis),
+                                    Err(e) => println!("LLM analysis failed: {}", e),
+                                }
                             }
                         }
                     }
@@ -463,3 +571,4 @@ fn capture_screen(screen_index: usize, output_filename: Option<&str>) -> Result<
         }
     }
 }
+
